@@ -1,0 +1,364 @@
+# Tambahkan endpoint ini ke Flask app Anda (paste.txt)
+
+# API Routes untuk ESP32 (tanpa login requirement)
+@app.route('/api/scan-barcode', methods=['POST'])
+def api_scan_barcode():
+    """
+    API endpoint untuk ESP32 - tidak memerlukan login session
+    Menggunakan user default untuk testing
+    """
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({'success': False, 'message': 'No JSON data received'})
+        
+        barcode = data.get('barcode')
+        weight_detected = data.get('weight', 0)  # Weight in grams
+        
+        if not barcode:
+            return jsonify({'success': False, 'message': 'Barcode required'})
+        
+        print(f"ESP32 Request - Barcode: {barcode}, Weight: {weight_detected}g")
+        
+        # Find product by barcode
+        product = Product.query.filter_by(barcode=barcode).first()
+        if not product:
+            return jsonify({
+                'success': False, 
+                'message': 'Produk tidak ditemukan!',
+                'barcode': barcode
+            })
+        
+        # Get or create a default user for ESP32 testing
+        esp32_user = User.query.filter_by(username='esp32_user').first()
+        if not esp32_user:
+            # Create ESP32 user for testing
+            esp32_user = User(
+                username='esp32_user',
+                email='esp32@smartcart.com',
+                password_hash=generate_password_hash('esp32123'),
+                role='user'
+            )
+            db.session.add(esp32_user)
+            db.session.commit()
+        
+        # Get or create active cart for ESP32 user
+        active_cart = Cart.query.filter_by(
+            user_id=esp32_user.id, 
+            status='active'
+        ).first()
+        
+        if not active_cart:
+            active_cart = Cart(
+                user_id=esp32_user.id,
+                session_id=f"esp32_cart_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
+            )
+            db.session.add(active_cart)
+            db.session.commit()
+        
+        # Check if item already exists in cart
+        existing_item = CartItem.query.filter_by(
+            cart_id=active_cart.id,
+            product_id=product.id
+        ).first()
+        
+        # Weight validation (tolerance 10% untuk fleksibilitas)
+        weight_tolerance = product.weight * 0.10  # 10% tolerance
+        is_valid_weight = abs(weight_detected - product.weight) <= weight_tolerance
+        
+        if existing_item:
+            # Update existing item
+            existing_item.quantity += 1
+            existing_item.weight_detected = weight_detected
+            existing_item.is_validated = is_valid_weight
+        else:
+            # Add new item
+            new_item = CartItem(
+                cart_id=active_cart.id,
+                product_id=product.id,
+                weight_detected=weight_detected,
+                is_validated=is_valid_weight
+            )
+            db.session.add(new_item)
+        
+        db.session.commit()
+        
+        # Calculate cart totals
+        cart_items = CartItem.query.filter_by(cart_id=active_cart.id).all()
+        total_items = sum(item.quantity for item in cart_items)
+        total_amount = sum(item.product.price * item.quantity for item in cart_items)
+        
+        # Update cart total
+        active_cart.total_amount = total_amount
+        db.session.commit()
+        
+        print(f"Product added - {product.name}, Valid: {is_valid_weight}")
+        
+        return jsonify({
+            'success': True,
+            'product': {
+                'id': product.id,
+                'name': product.name,
+                'price': product.price,
+                'expected_weight': product.weight,
+                'detected_weight': weight_detected,
+                'is_valid': is_valid_weight,
+                'barcode': barcode
+            },
+            'cart': {
+                'total_items': total_items,
+                'total_amount': total_amount,
+                'cart_id': active_cart.id
+            },
+            'message': 'Produk berhasil ditambahkan!' if is_valid_weight else 'Produk ditambahkan tapi berat tidak sesuai!'
+        })
+        
+    except Exception as e:
+        print(f"Error in api_scan_barcode: {str(e)}")
+        return jsonify({
+            'success': False,
+            'message': f'Server error: {str(e)}'
+        }), 500
+
+@app.route('/api/cart-status', methods=['GET'])
+def api_cart_status():
+    """
+    Get current cart status for ESP32
+    """
+    try:
+        # Get ESP32 user
+        esp32_user = User.query.filter_by(username='esp32_user').first()
+        if not esp32_user:
+            return jsonify({
+                'success': False,
+                'message': 'ESP32 user not found'
+            })
+        
+        # Get active cart
+        active_cart = Cart.query.filter_by(
+            user_id=esp32_user.id,
+            status='active'
+        ).first()
+        
+        if not active_cart:
+            return jsonify({
+                'success': True,
+                'cart': {
+                    'total_items': 0,
+                    'total_amount': 0,
+                    'status': 'empty'
+                }
+            })
+        
+        # Get cart items
+        cart_items = CartItem.query.filter_by(cart_id=active_cart.id).all()
+        total_items = sum(item.quantity for item in cart_items)
+        
+        items_list = []
+        for item in cart_items:
+            items_list.append({
+                'product_name': item.product.name,
+                'quantity': item.quantity,
+                'price': item.product.price,
+                'weight_detected': item.weight_detected,
+                'is_validated': item.is_validated
+            })
+        
+        return jsonify({
+            'success': True,
+            'cart': {
+                'cart_id': active_cart.id,
+                'total_items': total_items,
+                'total_amount': active_cart.total_amount,
+                'status': 'active',
+                'items': items_list
+            }
+        })
+        
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'message': f'Error: {str(e)}'
+        }), 500
+
+@app.route('/api/checkout-esp32', methods=['POST'])
+def api_checkout_esp32():
+    """
+    Checkout for ESP32 cart
+    """
+    try:
+        data = request.get_json() or {}
+        payment_method = data.get('payment_method', 'cash')
+        
+        # Get ESP32 user
+        esp32_user = User.query.filter_by(username='esp32_user').first()
+        if not esp32_user:
+            return jsonify({
+                'success': False,
+                'message': 'ESP32 user not found'
+            })
+        
+        # Get active cart
+        active_cart = Cart.query.filter_by(
+            user_id=esp32_user.id,
+            status='active'
+        ).first()
+        
+        if not active_cart:
+            return jsonify({
+                'success': False,
+                'message': 'No active cart found'
+            })
+        
+        cart_items = CartItem.query.filter_by(cart_id=active_cart.id).all()
+        if not cart_items:
+            return jsonify({
+                'success': False,
+                'message': 'Cart is empty'
+            })
+        
+        # Calculate total
+        total_amount = sum(item.product.price * item.quantity for item in cart_items)
+        
+        # Create transaction
+        transaction = Transaction(
+            user_id=esp32_user.id,
+            cart_id=active_cart.id,
+            total_amount=total_amount,
+            payment_method=payment_method,
+            status='completed'
+        )
+        
+        # Update cart status
+        active_cart.status = 'completed'
+        active_cart.total_amount = total_amount
+        
+        db.session.add(transaction)
+        db.session.commit()
+        
+        print(f"ESP32 Checkout completed - Transaction ID: {transaction.id}")
+        
+        return jsonify({
+            'success': True,
+            'transaction_id': transaction.id,
+            'total_amount': total_amount,
+            'total_items': sum(item.quantity for item in cart_items),
+            'payment_method': payment_method,
+            'message': 'Checkout berhasil!'
+        })
+        
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'message': f'Checkout error: {str(e)}'
+        }), 500
+
+@app.route('/api/clear-cart', methods=['POST'])
+def api_clear_cart():
+    """
+    Clear ESP32 cart
+    """
+    try:
+        # Get ESP32 user
+        esp32_user = User.query.filter_by(username='esp32_user').first()
+        if not esp32_user:
+            return jsonify({
+                'success': False,
+                'message': 'ESP32 user not found'
+            })
+        
+        # Get active cart
+        active_cart = Cart.query.filter_by(
+            user_id=esp32_user.id,
+            status='active'
+        ).first()
+        
+        if active_cart:
+            # Delete all cart items
+            CartItem.query.filter_by(cart_id=active_cart.id).delete()
+            
+            # Update cart
+            active_cart.total_amount = 0
+            db.session.commit()
+        
+        return jsonify({
+            'success': True,
+            'message': 'Cart cleared successfully'
+        })
+        
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'message': f'Error: {str(e)}'
+        }), 500
+
+@app.route('/api/products', methods=['GET'])
+def api_products():
+    """
+    Get all products for ESP32 reference
+    """
+    try:
+        products = Product.query.all()
+        products_list = []
+        
+        for product in products:
+            products_list.append({
+                'id': product.id,
+                'barcode': product.barcode,
+                'name': product.name,
+                'price': product.price,
+                'weight': product.weight,
+                'stock': product.stock
+            })
+        
+        return jsonify({
+            'success': True,
+            'products': products_list,
+            'total': len(products_list)
+        })
+        
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'message': f'Error: {str(e)}'
+        }), 500
+
+# Health check endpoint
+@app.route('/health', methods=['GET'])
+def health_check():
+    """
+    Simple health check for ESP32
+    """
+    return jsonify({
+        'status': 'OK',
+        'message': 'Flask Smart Cart API is running',
+        'timestamp': datetime.utcnow().isoformat()
+    })
+
+# Test endpoint untuk ESP32
+@app.route('/test-esp32', methods=['GET', 'POST'])
+def test_esp32():
+    """
+    Test endpoint untuk memastikan koneksi ESP32 bekerja
+    """
+    if request.method == 'GET':
+        return jsonify({
+            'message': 'ESP32 connection test successful',
+            'server_time': datetime.utcnow().isoformat(),
+            'available_endpoints': [
+                '/api/scan-barcode',
+                '/api/cart-status', 
+                '/api/checkout-esp32',
+                '/api/clear-cart',
+                '/api/products',
+                '/health'
+            ]
+        })
+    
+    # POST test
+    data = request.get_json() or {}
+    return jsonify({
+        'message': 'POST test successful',
+        'received_data': data,
+        'server_time': datetime.utcnow().isoformat()
+    })

@@ -1,0 +1,62 @@
+{% extends "base.html" %}
+
+{% block title %}Tambah Produk - Admin{% endblock %}
+
+{% block content %}
+<div class="row mt-3 justify-content-center">
+  <div class="col-md-6">
+    <div class="card">
+      <div class="card-header">
+        <h5><i class="fas fa-plus"></i> Tambah Produk Baru</h5>
+      </div>
+      <div class="card-body">
+        <form method="POST">
+          <!-- Input barcode -->
+          <div class="mb-3">
+            <label for="barcode-input" class="form-label">Nomor Barcode</label>
+            <input type="text" class="form-control" id="barcode-input" name="barcode" required autofocus>
+          </div>
+
+          <div class="mb-3">
+            <label for="name" class="form-label">Nama Produk</label>
+            <input type="text" class="form-control" id="name" name="name" required>
+          </div>
+
+          <div class="mb-3">
+            <label for="price" class="form-label">Harga (Rp)</label>
+            <input type="number" class="form-control" id="price" name="price" step="0.01" required>
+          </div>
+
+          <div class="mb-3">
+            <label for="weight" class="form-label">Berat (gram)</label>
+            <input type="number" class="form-control" id="weight" name="weight" step="0.1" required>
+          </div>
+
+          <div class="mb-3">
+            <label for="stock" class="form-label">Stok</label>
+            <input type="number" class="form-control" id="stock" name="stock" required>
+          </div>
+
+          <button type="submit" class="btn btn-primary w-100">
+            <i class="fas fa-save"></i> Simpan Produk
+          </button>
+        </form>
+
+        <a href="{{ url_for('admin_products') }}" class="btn btn-secondary w-100 mt-2">
+          <i class="fas fa-arrow-left"></i> Kembali
+        </a>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Script agar setelah scan, fokus pindah -->
+<script>
+  document.getElementById("barcode-input").addEventListener("keypress", function (e) {
+    if (e.key === "Enter") {
+      e.preventDefault(); // Hindari submit form langsung
+      document.getElementById("name").focus(); // Pindah ke input nama produk
+    }
+  });
+</script>
+{% endblock %}

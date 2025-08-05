@@ -1,0 +1,620 @@
+from flask import Flask, render_template, request, redirect, url_for, flash, session, jsonify
+from flask_sqlalchemy import SQLAlchemy
+from werkzeug.security import generate_password_hash, check_password_hash
+from functools import wraps
+from datetime import datetime, timezone
+import os
+import logging
+import threading
+import time
+from collections import deque
+
+# Disable Firebase temporarily to focus on core functionality
+# import firebase_admin
+# from firebase_admin import credentials, firestore
+
+logging.basicConfig(level=logging.DEBUG)
+
+app = Flask(__name__)
+app.config['SECRET_KEY'] = 'a8f4b6d9c3e2f1a0b7d6c5e4a3f2b1c0'
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///smart_cart.db'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+
+db = SQLAlchemy(app)
+
+# Disable Firebase for now - focus on core functionality
+firestore_db = None
+logging.info("Firebase disabled - using local storage only")
+
+# Models
+class User(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(80), unique=True, nullable=False)
+    email = db.Column(db.String(120), unique=True, nullable=False)
+    password_hash = db.Column(db.String(120), nullable=False)
+    role = db.Column(db.String(20), default='user')  # 'user' or 'admin'
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+
+class Product(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    barcode = db.Column(db.String(50), unique=True, nullable=False)
+    name = db.Column(db.String(100), nullable=False)
+    price = db.Column(db.Float, nullable=False)
+    weight = db.Column(db.Float, nullable=False)  # Expected weight in grams
+    stock = db.Column(db.Integer, default=0)
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+
+class Cart(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    session_id = db.Column(db.String(100), nullable=False)
+    status = db.Column(db.String(20), default='active')  # 'active', 'checkout', 'completed'
+    total_amount = db.Column(db.Float, default=0)
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+
+class CartItem(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    cart_id = db.Column(db.Integer, db.ForeignKey('cart.id'), nullable=False)
+    product_id = db.Column(db.Integer, db.ForeignKey('product.id'), nullable=False)
+    quantity = db.Column(db.Integer, default=1)
+    weight_detected = db.Column(db.Float, nullable=True)
+    is_validated = db.Column(db.Boolean, default=False)
+    added_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+    
+    product = db.relationship('Product', backref='cart_items')
+
+class Transaction(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    cart_id = db.Column(db.Integer, db.ForeignKey('cart.id'), nullable=False)
+    total_amount = db.Column(db.Float, nullable=False)
+    payment_method = db.Column(db.String(50), nullable=False)
+    status = db.Column(db.String(20), default='pending')  # 'pending', 'completed', 'cancelled'
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+    
+    user = db.relationship('User', backref='transactions')
+    cart = db.relationship('Cart', backref='transaction')
+
+# LCD Message Management
+lcd_message_queue = deque(maxlen=1)  # Hanya simpan pesan terbaru
+current_lcd_status = {
+    'message': 'Smart Cart Ready',
+    'line1': 'Smart Cart',
+    'line2': 'System Ready',
+    'line3': '',
+    'line4': '',
+    'timestamp': time.time()
+}
+
+def send_lcd_message(message, line1="", line2="", line3="", line4=""):
+    """Kirim pesan ke LCD ESP32 secara real-time"""
+    global current_lcd_status
+    
+    try:
+        current_lcd_status = {
+            'message': message,
+            'line1': line1 or message,
+            'line2': line2,
+            'line3': line3,
+            'line4': line4,
+            'timestamp': time.time()
+        }
+        
+        # Simpan ke queue untuk ESP32
+        lcd_message_queue.append(current_lcd_status.copy())
+        
+        logging.info(f"LCD Message updated: {message}")
+        logging.info(f"Line1: {line1}, Line2: {line2}")
+    except Exception as e:
+        logging.error(f"Error updating LCD message: {e}")
+
+def send_weight_data(weight):
+    """Placeholder for weight data - local storage only"""
+    logging.info(f"Weight data received: {weight}g (local storage)")
+
+# Decorators
+def login_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if 'user_id' not in session:
+            flash('Silakan login terlebih dahulu.', 'warning')
+            return redirect(url_for('login'))
+        return f(*args, **kwargs)
+    return decorated_function
+
+def admin_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if 'user_id' not in session:
+            flash('Silakan login terlebih dahulu.', 'warning')
+            return redirect(url_for('login'))
+        
+        user = db.session.get(User, session['user_id'])
+        if not user or user.role != 'admin':
+            flash('Akses ditolak. Anda bukan administrator.', 'danger')
+            return redirect(url_for('dashboard'))
+        return f(*args, **kwargs)
+    return decorated_function
+
+def clear_old_messages():
+    """Background task untuk membersihkan pesan LCD lama"""
+    while True:
+        time.sleep(10)  # Check setiap 10 detik
+        global current_lcd_status
+        
+        # Jika pesan sudah lebih dari 15 detik, ganti dengan pesan default
+        if time.time() - current_lcd_status.get('timestamp', 0) > 15:
+            current_lcd_status = {
+                'message': 'Smart Cart Ready',
+                'line1': 'Smart Cart',
+                'line2': 'System Ready',
+                'line3': '',
+                'line4': '',
+                'timestamp': time.time()
+            }
+
+# Routes
+@app.route('/')
+def index():
+    send_lcd_message("Selamat datang", "Smart Cart System", "Selamat datang", "di sistem kami", "")
+    if 'user_id' in session:
+        return redirect(url_for('dashboard'))
+    return render_template('index.html')
+
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    if request.method == 'POST':
+        username = request.form['username']
+        email = request.form['email']
+        password = request.form['password']
+        confirm_password = request.form['confirm_password']
+        
+        if password != confirm_password:
+            flash('Password tidak cocok!', 'danger')
+            return render_template('register.html')
+        
+        if User.query.filter_by(username=username).first():
+            flash('Username sudah digunakan!', 'danger')
+            return render_template('register.html')
+        
+        if User.query.filter_by(email=email).first():
+            flash('Email sudah digunakan!', 'danger')
+            return render_template('register.html')
+        
+        password_hash = generate_password_hash(password)
+        new_user = User(username=username, email=email, password_hash=password_hash)
+        
+        db.session.add(new_user)
+        db.session.commit()
+        
+        flash('Registrasi berhasil! Silakan login.', 'success')
+        return redirect(url_for('login'))
+    
+    return render_template('register.html')
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'GET':
+        send_lcd_message("Silakan login", "Smart Cart System", "Silakan login", "untuk melanjutkan", "")
+    
+    if request.method == 'POST':
+        username_or_email = request.form['username_or_email']
+        password = request.form['password']
+
+        user = User.query.filter_by(username=username_or_email).first() or \
+               User.query.filter_by(email=username_or_email).first()
+
+        if user and check_password_hash(user.password_hash, password):
+            session['user_id'] = user.id
+            session['username'] = user.username
+            session['role'] = user.role
+            
+            if user.role == 'admin':
+                send_lcd_message("Login Admin", "Smart Cart System", "Login Admin", "Berhasil!", "")
+                return redirect(url_for('admin_dashboard'))
+            else:
+                send_lcd_message(f"Selamat datang {user.username}", 
+                               "Smart Cart System", 
+                               "Selamat datang", 
+                               user.username, 
+                               "")
+                return redirect(url_for('dashboard'))
+        else:
+            flash('Username/Email atau password salah.', 'danger')
+    
+    return render_template('login.html')
+
+@app.route('/logout')
+def logout():
+    session.clear()
+    flash('Anda telah logout.', 'info')
+    send_lcd_message("Logout berhasil", "Smart Cart System", "Anda telah", "logout", "")
+    return redirect(url_for('index'))
+
+@app.route('/dashboard')
+@login_required
+def dashboard():
+    user = db.session.get(User, session['user_id'])
+    active_cart = Cart.query.filter_by(user_id=user.id, status='active').first()
+    
+    if not active_cart:
+        active_cart = Cart(
+            user_id=user.id,
+            session_id=f"cart_{user.id}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
+        )
+        db.session.add(active_cart)
+        db.session.commit()
+    
+    cart_items = db.session.query(CartItem).filter_by(cart_id=active_cart.id).all()
+    total_amount = sum(item.product.price * item.quantity for item in cart_items)
+    active_cart.total_amount = total_amount
+    db.session.commit()
+    
+    send_lcd_message(f"Selamat datang {user.username}", 
+                   "Dashboard User",
+                   f"Selamat datang",
+                   user.username,
+                   f"Keranjang: {len(cart_items)} item")
+    
+    return render_template('dashboard.html',
+                            user=user,
+                            cart=active_cart,
+                            cart_items=cart_items)
+
+@app.route('/admin')
+@admin_required
+def admin_dashboard():
+    total_users = User.query.count()
+    total_products = Product.query.count()
+    total_transactions = Transaction.query.count()
+    recent_transactions = Transaction.query.order_by(Transaction.created_at.desc()).limit(10).all()
+    
+    send_lcd_message("Halaman admin", 
+                   "Admin Dashboard",
+                   "Halaman admin",
+                   "Panel Admin",
+                   "")
+    
+    return render_template('admin_dashboard.html',
+                            total_users=total_users,
+                            total_products=total_products,
+                            total_transactions=total_transactions,
+                            recent_transactions=recent_transactions)
+
+@app.route('/admin/products')
+@admin_required
+def admin_products():
+    products = Product.query.all()
+    count = len(products)
+    
+    send_lcd_message(f"Jumlah produk: {count}", 
+                   "Admin Produk",
+                   "Jumlah produk:",
+                   str(count),
+                   f"Total: {count} items")
+    
+    return render_template('admin_products.html', products=products)
+
+@app.route('/admin/products/add', methods=['GET', 'POST'])
+@admin_required
+def add_product():
+    if request.method == 'POST':
+        barcode = request.form['barcode']
+        name = request.form['name']
+        price = float(request.form['price'])
+        weight = float(request.form['weight'])
+        stock = int(request.form['stock'])
+        
+        if Product.query.filter_by(barcode=barcode).first():
+            flash('Barcode sudah ada!', 'danger')
+            return render_template('add_product.html')
+        
+        new_product = Product(
+            barcode=barcode,
+            name=name,
+            price=price,
+            weight=weight,
+            stock=stock
+        )
+        
+        db.session.add(new_product)
+        db.session.commit()
+        
+        send_lcd_message(f"{name} - Rp{price:,.0f}", 
+                       "Produk Baru",
+                       name,
+                       f"Rp {price:,.0f}",
+                       "Berhasil ditambah!")
+        
+        flash('Produk berhasil ditambahkan!', 'success')
+        return redirect(url_for('admin_products'))
+    
+    return render_template('add_product.html')
+
+@app.route('/admin/users')
+@admin_required
+def admin_users():
+    users = User.query.all()
+    count = len(users)
+    
+    send_lcd_message(f"Jumlah user: {count}", 
+                   "Admin User",
+                   "Jumlah user:",
+                   str(count),
+                   f"Total: {count} users")
+    
+    return render_template('admin_users.html', users=users)
+
+@app.route('/admin/transactions')
+@admin_required
+def admin_transactions():
+    transactions = Transaction.query.order_by(Transaction.created_at.desc()).all()
+    count = len(transactions)
+    
+    send_lcd_message(f"Jumlah transaksi: {count}", 
+                   "Admin Transaksi",
+                   "Jumlah transaksi:",
+                   str(count),
+                   f"Total: {count}")
+    
+    return render_template('admin_transactions.html', transactions=transactions)
+
+# API Routes for ESP32 Communication
+@app.route('/api/lcd-status', methods=['GET'])
+def get_lcd_status():
+    """Endpoint untuk ESP32 mendapatkan status LCD terbaru"""
+    global current_lcd_status
+    
+    # Bersihkan pesan lama (lebih dari 30 detik)
+    if time.time() - current_lcd_status.get('timestamp', 0) > 30:
+        current_lcd_status = {
+            'message': 'Smart Cart Ready',
+            'line1': 'Smart Cart',
+            'line2': 'Ready',
+            'line3': '',
+            'line4': '',
+            'timestamp': time.time()
+        }
+    
+    logging.info(f"LCD Status requested: {current_lcd_status}")
+    return jsonify(current_lcd_status)
+
+@app.route('/api/scan-barcode', methods=['POST'])
+@login_required
+def scan_barcode():
+    """Enhanced scan barcode dengan integrasi ESP32"""
+    try:
+        data = request.get_json()
+        barcode = data.get('barcode')
+        weight_detected = data.get('weight', session.get('current_weight', 0))
+        
+        user_id = session['user_id']
+        
+        product = Product.query.filter_by(barcode=barcode).first()
+        if not product:
+            send_lcd_message("", 
+                           "Produk tidak",
+                           "ditemukan",
+                           f"Barcode: {barcode[:10]}",
+                           "")
+            return jsonify({'success': False, 'message': 'Produk tidak ditemukan!'})
+        
+        active_cart = Cart.query.filter_by(user_id=user_id, status='active').first()
+        if not active_cart:
+            active_cart = Cart(
+                user_id=user_id,
+                session_id=f"cart_{user_id}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
+            )
+            db.session.add(active_cart)
+            db.session.commit()
+        
+        existing_item = CartItem.query.filter_by(
+            cart_id=active_cart.id,
+            product_id=product.id
+        ).first()
+        
+        if existing_item:
+            existing_item.quantity += 1
+            existing_item.weight_detected = weight_detected
+        else:
+            new_item = CartItem(
+                cart_id=active_cart.id,
+                product_id=product.id,
+                weight_detected=weight_detected
+            )
+            db.session.add(new_item)
+        
+        weight_tolerance = product.weight * 0.05
+        is_valid_weight = abs(weight_detected - product.weight) <= weight_tolerance
+        
+        if existing_item:
+            existing_item.is_validated = is_valid_weight
+        else:
+            new_item.is_validated = is_valid_weight
+        
+        db.session.commit()
+        
+        # Update total keranjang
+        cart_items = CartItem.query.filter_by(cart_id=active_cart.id).all()
+        total_items = len(cart_items)
+        total_amount = sum(item.product.price * item.quantity for item in cart_items)
+        active_cart.total_amount = total_amount
+        db.session.commit()
+        
+        # Kirim ke LCD
+        send_lcd_message("", 
+                       product.name[:16],
+                       f"Rp {product.price:,.0f}",
+                       f"Total: {total_items} item",
+                       "Ditambahkan!")
+        
+        return jsonify({
+            'success': True,
+            'product': {
+                'name': product.name,
+                'price': product.price,
+                'expected_weight': product.weight,
+                'detected_weight': weight_detected,
+                'is_valid': is_valid_weight,
+                'total_items': total_items,
+                'total_amount': total_amount
+            }
+        })
+    
+    except Exception as e:
+        logging.error(f"Error in scan_barcode: {e}")
+        send_lcd_message("", "Error", "Sistem error", "", "")
+        return jsonify({'success': False, 'message': 'Terjadi kesalahan sistem'}), 500
+
+@app.route('/api/checkout', methods=['POST'])
+@login_required
+def checkout():
+    data = request.get_json()
+    payment_method = data.get('payment_method', 'cash')
+    
+    user_id = session['user_id']
+    
+    active_cart = Cart.query.filter_by(user_id=user_id, status='active').first()
+    if not active_cart:
+        return jsonify({'success': False, 'message': 'Keranjang kosong!'})
+    
+    cart_items = CartItem.query.filter_by(cart_id=active_cart.id).all()
+    if not cart_items:
+        return jsonify({'success': False, 'message': 'Keranjang kosong!'})
+    
+    total_amount = sum(item.product.price * item.quantity for item in cart_items)
+    
+    transaction = Transaction(
+        user_id=user_id,
+        cart_id=active_cart.id,
+        total_amount=total_amount,
+        payment_method=payment_method,
+        status='completed'
+    )
+    
+    active_cart.status = 'completed'
+    active_cart.total_amount = total_amount
+    
+    db.session.add(transaction)
+    db.session.commit()
+    
+    send_lcd_message(f"Total: Rp{total_amount:,.0f} - {len(cart_items)} item", 
+                   "Checkout Berhasil",
+                   f"Total: Rp {total_amount:,.0f}",
+                   f"{len(cart_items)} item",
+                   "Terima kasih!")
+    
+    return jsonify({
+        'success': True,
+        'transaction_id': transaction.id,
+        'total_amount': total_amount,
+        'message': 'Checkout berhasil!'
+    })
+
+@app.route('/checkout', methods=['GET', 'POST'])
+@login_required
+def checkout_page():
+    if request.method == 'POST':
+        return jsonify({'status': 'checkout berhasil'})
+
+    user_id = session['user_id']
+    active_cart = Cart.query.filter_by(user_id=user_id, status='active').first()
+    
+    if not active_cart:
+        flash('Keranjang kosong!', 'warning')
+        return redirect(url_for('dashboard'))
+    
+    cart_items = CartItem.query.filter_by(cart_id=active_cart.id).all()
+    if not cart_items:
+        flash('Keranjang kosong!', 'warning')
+        return redirect(url_for('dashboard'))
+    
+    total_items = len(cart_items)
+    total_price = active_cart.total_amount
+    
+    send_lcd_message(f"Total: Rp{total_price:,.0f} - {total_items} barang", 
+                   "Checkout",
+                   f"Total: Rp {total_price:,.0f}",
+                   f"{total_items} barang",
+                   "Konfirmasi bayar")
+    
+    return render_template('checkout.html', cart=active_cart, cart_items=cart_items)
+
+@app.route('/api/weight', methods=['POST'])
+def receive_weight():
+    """Endpoint untuk menerima data berat dari ESP32"""
+    try:
+        data = request.get_json()
+        weight = data.get('weight', 0)
+        
+        logging.info(f"Weight received from ESP32: {weight}g")
+        
+        # Simpan berat ke session atau database jika diperlukan
+        session['current_weight'] = weight
+        
+        # Kirim respons ke LCD jika berat signifikan
+        if weight > 5:  # Hanya jika ada berat yang signifikan
+            send_lcd_message("", 
+                           f"Berat: {weight:.1f}g",
+                           "Barang terdeteksi",
+                           "",
+                           "")
+        
+        return jsonify({"status": "ok", "weight_received": weight})
+    
+    except Exception as e:
+        logging.error(f"Error receiving weight: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+# Test endpoint to manually trigger LCD messages
+@app.route('/api/test-lcd', methods=['POST'])
+def test_lcd():
+    """Test endpoint untuk testing LCD messages"""
+    data = request.get_json() or {}
+    message = data.get('message', 'Test Message')
+    line1 = data.get('line1', 'Test Line 1')
+    line2 = data.get('line2', 'Test Line 2')
+    
+    send_lcd_message(message, line1, line2, "", "")
+    
+    return jsonify({"status": "ok", "message": "LCD message sent"})
+
+if __name__ == '__main__':
+    # Start background thread untuk clear messages
+    message_cleaner = threading.Thread(target=clear_old_messages, daemon=True)
+    message_cleaner.start()
+    
+    with app.app_context():
+        db.create_all()
+        
+        # Create admin user if not exists
+        admin = User.query.filter_by(username='admin').first()
+        if not admin:
+            admin_user = User(
+                username='admin',
+                email='admin@smartcart.com',
+                password_hash=generate_password_hash('admin123'),
+                role='admin'
+            )
+            db.session.add(admin_user)
+            
+            # Add sample products
+            sample_products = [
+                Product(barcode='1234567890', name='Coca Cola 330ml', price=5000, weight=350, stock=50),
+                Product(barcode='0987654321', name='Indomie Goreng', price=3000, weight=85, stock=100),
+                Product(barcode='1122334455', name='Beras 1kg', price=15000, weight=1000, stock=25),
+                Product(barcode='5544332211', name='Minyak Goreng 1L', price=18000, weight=900, stock=30),
+            ]
+            
+            for product in sample_products:
+                db.session.add(product)
+            
+            db.session.commit()
+            logging.info("Admin user and sample products created!")
+    
+    # Run Flask app
+    app.run(debug=True, host='0.0.0.0', port=5000)
+
+    # .\venv\Scripts\activate    //code aktifkan codingan
+    # python app.py     //jalankan aplikasi
+    # http://127.0.0.1:5000     //masuk aplikasi

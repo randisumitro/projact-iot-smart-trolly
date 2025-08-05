@@ -1,0 +1,131 @@
+{% extends "base.html" %}
+
+{% block title %}Dashboard - Smart Shopping Cart{% endblock %}
+
+{% block content %}
+<div class="row mt-3">
+    <div class="col-md-8">
+        <div class="card">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <h5><i class="fas fa-shopping-basket"></i> Keranjang Belanja</h5>
+                <span class="badge bg-primary">{{ cart_items|length }} Item</span>
+            </div>
+            <div class="card-body">
+                {% if cart_items %}
+                    {% for item in cart_items %}
+                    <div class="cart-item p-3 mb-3 border rounded">
+                        <div class="row align-items-center">
+                            <div class="col-md-6">
+                                <h6>{{ item.product.name }}</h6>
+                                <small class="text-muted">{{ item.product.barcode }}</small>
+                            </div>
+                            <div class="col-md-2">
+                                <span class="badge bg-secondary">{{ item.quantity }}x</span>
+                            </div>
+                            <div class="col-md-2">
+                                <strong>Rp {{ "{:,.0f}".format(item.product.price * item.quantity) }}</strong>
+                            </div>
+                            <div class="col-md-2">
+                                {% if item.is_validated %}
+                                    <i class="fas fa-check-circle weight-valid" title="Berat Valid"></i>
+                                {% else %}
+                                    <i class="fas fa-exclamation-triangle weight-invalid" title="Berat Tidak Valid"></i>
+                                {% endif %}
+                            </div>
+                        </div>
+                        <small class="text-muted">
+                            Berat: {{ item.weight_detected or 0 }}g / {{ item.product.weight }}g (target)
+                        </small>
+                    </div>
+                    {% endfor %}
+                {% else %}
+                    <div class="text-center py-5">
+                        <i class="fas fa-shopping-cart fa-3x text-muted mb-3"></i>
+                        <p class="text-muted">Keranjang belanja kosong</p>
+                        <p>Mulai scan barcode produk untuk menambahkan item</p>
+                    </div>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+    
+    <div class="col-md-4">
+        <div class="card mb-3">
+            <div class="card-header">
+                <h5><i class="fas fa-calculator"></i> Total Belanja</h5>
+            </div>
+            <div class="card-body text-center">
+                <h2 class="text-primary">Rp {{ "{:,.0f}".format(cart.total_amount) }}</h2>
+                {% if cart_items %}
+                    <a href="{{ url_for('checkout_page') }}" class="btn btn-success btn-lg w-100 mt-3">
+                        <i class="fas fa-credit-card"></i> Checkout
+                    </a>
+                {% endif %}
+            </div>
+        </div>
+        
+        <div class="card">
+            <div class="card-body">
+                <div class="mb-3">
+                    <input type="text" class="form-control" id="barcodeInput" placeholder="Scan barcode..." autofocus>
+                </div>
+                <div class="mb-3">
+                    <input type="number" class="form-control" id="weightInput" placeholder="Berat (gram)" step="0.1">
+                </div>
+                <button class="btn btn-primary w-100" onclick="scanBarcode()">
+                    <i class="fas fa-plus"></i> Tambah Produk
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+async function scanBarcode() {
+    const barcode = document.getElementById('barcodeInput').value.trim();
+    const weight = document.getElementById('weightInput').value;
+
+    if (!barcode) {
+        alert('Masukkan barcode terlebih dahulu!');
+        return;
+    }
+
+    try {
+        const response = await fetch('/api/scan-barcode', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+                barcode: barcode,
+                weight: parseFloat(weight) || 0
+            })
+        });
+
+        const result = await response.json();
+
+        if (result.success) {
+            alert(`Produk "${result.product.name}" berhasil ditambahkan!`);
+            location.reload();
+        } else {
+            alert(result.message);
+        }
+    } catch (error) {
+        alert('Terjadi kesalahan saat menambahkan produk');
+    }
+
+    // Clear inputs
+    document.getElementById('barcodeInput').value = '';
+    document.getElementById('weightInput').value = '';
+    document.getElementById('barcodeInput').focus();
+}
+
+// Jalankan scanBarcode() saat Enter ditekan
+document.getElementById('barcodeInput').addEventListener('keypress', function(e) {
+    if (e.key === 'Enter') {
+        e.preventDefault(); // hindari reload form
+        scanBarcode();
+    }
+});
+</script>
+{% endblock %}

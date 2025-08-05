@@ -1,0 +1,401 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <LiquidCrystal_I2C.h>
+#include <HX711.h>
+
+// WiFi credentials
+const char* ssid = "vivo Y33s";
+const char* password = "00000000";
+
+// Flask server configuration - PERBAIKAN: Gunakan IP yang benar
+const char* serverURL = "http://192.168.172.192:5000"; // Ganti sesuai IP komputer Anda
+unsigned long lastUpdate = 0;
+const unsigned long updateInterval = 3000; // Perlambat ke 3 detik untuk mengurangi beban
+
+// LCD Configuration (I2C)
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// HX711 Load Cell Configuration  
+#define LOADCELL_DOUT_PIN  19
+#define LOADCELL_SCK_PIN   18
+HX711 scale;
+
+// Buzzer Configuration
+#define BUZZER_PIN 23
+
+// Variables
+float currentWeight = 0.0;
+float previousWeight = 0.0;
+String currentMessage = "";
+String line1 = "", line2 = "", line3 = "", line4 = "";
+bool weightChanged = false;
+bool serverConnected = false;
+
+// Calibration factor for load cell
+float calibrationFactor = -7050.0;
+
+void setup() {
+  Serial.begin(115200);
+  
+  // Initialize I2C LCD
+  lcd.init();
+  lcd.backlight();
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Smart Cart");
+  lcd.setCursor(0, 1);
+  lcd.print("Initializing...");
+  
+  Serial.println("LCD Initialized");
+  
+  // Initialize buzzer
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+  
+  // Initialize load cell
+  Serial.println("Initializing HX711...");
+  scale.begin(LOADCELL_DOUT_PIN, LOADCELL_SCK_PIN);
+  
+  if (scale.is_ready()) {
+    Serial.println("HX711 found");
+    scale.set_scale(calibrationFactor);
+    scale.tare();
+    Serial.println("Scale tared");
+  } else {
+    Serial.println("HX711 not found - check wiring");
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("");
+    lcd.setCursor(0, 1);
+    lcd.print("");
+    delay(3000);
+  }
+  
+  // Connect to WiFi
+  connectToWiFi();
+  
+  // Test server connection
+  testServerConnection();
+  
+  // Beep to indicate ready
+  beep(serverConnected ? 2 : 1);
+  
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("System Ready");
+  lcd.setCursor(0, 1);
+  lcd.print(serverConnected ? "Server OK" : "Server Error");
+  delay(2000);
+}
+
+void loop() {
+  // Check WiFi connection
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi disconnected, reconnecting...");
+    connectToWiFi();
+    return;
+  }
+  
+  // Read weight from load cell
+  readWeight();
+  
+  // Send weight data if changed significantly
+  if (weightChanged && serverConnected) {
+    sendWeightData();
+    weightChanged = false;
+  }
+  
+  // Get LCD messages from server
+  if (millis() - lastUpdate > updateInterval) {
+    if (serverConnected) {
+      getLCDMessages();
+    }
+    lastUpdate = millis();
+  }
+  
+  delay(100);
+}
+
+void connectToWiFi() {
+  WiFi.begin(ssid, password);
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Connecting WiFi");
+  
+  int dots = 0;
+  while (WiFi.status() != WL_CONNECTED && dots < 30) {
+    delay(500);
+    Serial.print(".");
+    lcd.setCursor(dots % 16, 1);
+    lcd.print(".");
+    dots++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println();
+    Serial.println("WiFi connected!");
+    Serial.print("IP address: ");
+    Serial.println(WiFi.localIP());
+    
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("WiFi Connected!");
+    lcd.setCursor(0, 1);
+    lcd.print(WiFi.localIP().toString());
+    delay(2000);
+  } else {
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("WiFi Failed!");
+    lcd.setCursor(0, 1);
+    lcd.print("Check Settings");
+    Serial.println("WiFi connection failed!");
+  }
+}
+
+void testServerConnection() {
+  if (WiFi.status() != WL_CONNECTED) {
+    serverConnected = false;
+    return;
+  }
+  
+  Serial.println("Testing server connection...");
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Testing Server");
+  
+  HTTPClient http;
+  http.begin(String(serverURL) + "/api/lcd-status");
+  http.setTimeout(5000); // 5 second timeout
+  
+  int httpResponseCode = http.GET();
+  
+  if (httpResponseCode == 200) {
+    serverConnected = true;
+    Serial.println("Server connection successful!");
+    lcd.setCursor(0, 1);
+    lcd.print("Server OK");
+  } else {
+    serverConnected = false;
+    Serial.print("Server connection failed. HTTP Code: ");
+    Serial.println(httpResponseCode);
+    lcd.setCursor(0, 1);
+    lcd.print("Server Error");
+    
+    // Print actual server URL being used
+    Serial.print("Trying to connect to: ");
+    Serial.println(String(serverURL) + "/api/lcd-status");
+  }
+  
+  http.end();
+  delay(2000);
+}
+
+void readWeight() {
+  if (scale.is_ready()) {
+    currentWeight = scale.get_units(5);
+    
+    if (abs(currentWeight - previousWeight) > 2.0) {
+      weightChanged = true;
+      previousWeight = currentWeight;
+      
+      // Display weight on LCD if no server message
+      if (currentMessage == "" || !serverConnected) {
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("Berat: ");
+        lcd.print(currentWeight, 1);
+        lcd.print("g");
+        lcd.setCursor(0, 1);
+        if (currentWeight > 5) {
+          lcd.print("Barang terdeteksi");
+        } else {
+          lcd.print("Kosong");
+        }
+      }
+      
+      Serial.print("Weight: ");
+      Serial.print(currentWeight);
+      Serial.println("g");
+    }
+  }
+}
+
+void sendWeightData() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  
+  HTTPClient http;
+  http.begin(String(serverURL) + "/api/weight");
+  http.addHeader("Content-Type", "application/json");
+  http.setTimeout(3000); // 3 second timeout
+  
+  DynamicJsonDocument doc(1024);
+  doc["weight"] = currentWeight;
+  
+  String requestBody;
+  serializeJson(doc, requestBody);
+  
+  int httpResponseCode = http.POST(requestBody);
+  
+  if (httpResponseCode > 0) {
+    String response = http.getString();
+    Serial.println("Weight sent successfully");
+    Serial.println("Response: " + response);
+  } else {
+    Serial.print("Error sending weight: ");
+    Serial.println(httpResponseCode);
+    
+    // If server is unreachable, mark as disconnected
+    if (httpResponseCode == -11 || httpResponseCode == -1) {
+      serverConnected = false;
+      Serial.println("Server marked as disconnected");
+    }
+  }
+  
+  http.end();
+}
+
+void getLCDMessages() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  
+  HTTPClient http;
+  http.begin(String(serverURL) + "/api/lcd-status");
+  http.setTimeout(3000); // 3 second timeout
+  
+  int httpResponseCode = http.GET();
+  
+  if (httpResponseCode == 200) {
+    String payload = http.getString();
+    
+    DynamicJsonDocument doc(1024);
+    DeserializationError error = deserializeJson(doc, payload);
+    
+    if (!error) {
+      String newMessage = doc["message"] | "";
+      String newLine1 = doc["line1"] | "";
+      String newLine2 = doc["line2"] | "";
+      String newLine3 = doc["line3"] | "";
+      String newLine4 = doc["line4"] | "";
+      
+      // Update LCD if message changed
+      if (newMessage != currentMessage || 
+          newLine1 != line1 || newLine2 != line2 || 
+          newLine3 != line3 || newLine4 != line4) {
+        
+        currentMessage = newMessage;
+        line1 = newLine1;
+        line2 = newLine2;
+        line3 = newLine3;
+        line4 = newLine4;
+        
+        updateLCD();
+        
+        // Mark server as connected since we got response
+        if (!serverConnected) {
+          serverConnected = true;
+          Serial.println("Server connection restored!");
+        }
+        
+        // Beep for important messages
+        if (newMessage.indexOf("berhasil") != -1 || 
+            newMessage.indexOf("Berhasil") != -1 ||
+            newMessage.indexOf("ditambah") != -1 ||
+            newMessage.indexOf("Selamat datang") != -1) {
+          beep(1);
+        }
+      }
+    } else {
+      Serial.println("JSON parsing error");
+    }
+  } else {
+    if (httpResponseCode != 404) {
+      Serial.print("Error getting LCD messages: ");
+      Serial.println(httpResponseCode);
+      
+      // If persistent connection errors, mark server as disconnected
+      if (httpResponseCode == -11 || httpResponseCode == -1) {
+        if (serverConnected) {
+          serverConnected = false;
+          Serial.println("Server marked as disconnected due to timeout");
+        }
+      }
+    }
+  }
+  
+  http.end();
+}
+
+void updateLCD() {
+  lcd.clear();
+  
+  // Display based on available lines
+  if (line1 != "" && line2 != "") {
+    lcd.setCursor(0, 0);
+    lcd.print(line1.substring(0, 16));
+    lcd.setCursor(0, 1);
+    lcd.print(line2.substring(0, 16));
+  } else if (line3 != "" && line4 != "") {
+    lcd.setCursor(0, 0);
+    lcd.print(line3.substring(0, 16));
+    lcd.setCursor(0, 1);
+    lcd.print(line4.substring(0, 16));
+  } else if (currentMessage != "") {
+    if (currentMessage.length() <= 16) {
+      lcd.setCursor(0, 0);
+      lcd.print(currentMessage);
+    } else {
+      String firstLine = currentMessage.substring(0, 16);
+      String secondLine = currentMessage.substring(16, 32);
+      
+      lcd.setCursor(0, 0);
+      lcd.print(firstLine);
+      lcd.setCursor(0, 1);
+      lcd.print(secondLine);
+    }
+  }
+  
+  Serial.println("LCD Updated:");
+  Serial.println("Line 1: " + (line1 != "" ? line1 : line3));
+  Serial.println("Line 2: " + (line2 != "" ? line2 : line4));
+}
+
+void beep(int times) {
+  for (int i = 0; i < times; i++) {
+    digitalWrite(BUZZER_PIN, HIGH);
+    delay(200);
+    digitalWrite(BUZZER_PIN, LOW);
+    if (i < times - 1) {
+      delay(200);
+    }
+  }
+}
+
+void calibrateLoadCell() {
+  Serial.println("Load Cell Calibration");
+  Serial.println("Remove all weight from scale");
+  Serial.println("Send 't' to tare");
+  Serial.println("Place known weight and send 'c' to calibrate");
+  
+  while (!Serial.available()) {}
+  
+  if (Serial.read() == 't') {
+    scale.tare();
+    Serial.println("Scale tared");
+  }
+  
+  Serial.println("Place known weight (e.g., 100g) and send 'c'");
+  
+  while (!Serial.available()) {}
+  
+  if (Serial.read() == 'c') {
+    float knownWeight = 100.0;
+    float reading = scale.get_units(10);
+    calibrationFactor = reading / knownWeight;
+    scale.set_scale(calibrationFactor);
+    
+    Serial.print("Calibration factor: ");
+    Serial.println(calibrationFactor);
+    Serial.println("Update this value in your code");
+  }
+}

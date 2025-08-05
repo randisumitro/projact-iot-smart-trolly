@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="row justify-content-center mt-5">
+    <div class="col-md-8 text-center">
+        <div class="card">
+            <div class="card-body p-5">
+                <i class="fas fa-shopping-cart fa-5x text-primary mb-4"></i>
+                <h1 class="card-title">Smart Shopping Cart</h1>
+                <p class="card-text lead">Sistem belanja pintar dengan teknologi barcode dan sensor berat</p>
+                
+                <div class="row mt-4">
+                    <div class="col-md-4">
+                        <i class="fas fa-barcode fa-2x text-success mb-2"></i>
+                        <h5>Scan Barcode</h5>
+                        <p>Pindai barcode produk secara otomatis</p>
+                    </div>
+                    <div class="col-md-4">
+                        <i class="fas fa-weight fa-2x text-info mb-2"></i>
+                        <h5>Deteksi Berat</h5>
+                        <p>Validasi produk dengan sensor berat</p>
+                    </div>
+                    <div class="col-md-4">
+                        <i class="fas fa-credit-card fa-2x text-warning mb-2"></i>
+                        <h5>Checkout Otomatis</h5>
+                        <p>Pembayaran cepat dan mudah</p>
+                    </div>
+                </div>
+                
+                <div class="mt-4">
+                    <a href="{{ url_for('login') }}" class="btn btn-primary btn-lg me-3">
+                        <i class="fas fa-sign-in-alt"></i> Mulai Belanja
+                    </a>
+                    <a href="{{ url_for('register') }}" class="btn btn-outline-primary btn-lg">
+                        <i class="fas fa-user-plus"></i> Daftar Akun
+                    </a>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}

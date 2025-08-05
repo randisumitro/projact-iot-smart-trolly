@@ -1,0 +1,46 @@
+#include <WiFi.h>
+#include <WebSocketsClient.h>
+#include <LiquidCrystal_I2C.h>
+
+const char* ssid = "Galaxy A15 5G D62D";
+const char* password = "12345678";
+
+WebSocketsClient webSocket;
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
+  switch(type) {
+    case WStype_TEXT:
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Pesan:");
+      lcd.setCursor(0, 1);
+      lcd.print((char*)payload);
+      break;
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  lcd.init();
+  lcd.backlight();
+  lcd.setCursor(0, 0);
+  lcd.print("Menghubungkan WiFi");
+
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    lcd.print(".");
+  }
+
+  lcd.clear();
+  lcd.print("WiFi Terhubung!");
+
+  webSocket.begin("10.34.215.192", 5000, "/socket.io/?EIO=4"); // IP PC 
+  webSocket.onEvent(webSocketEvent);
+  webSocket.setReconnectInterval(5000);
+}
+
+void loop() {
+  webSocket.loop();
+}
